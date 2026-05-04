@@ -1,0 +1,21 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+builds/
+*.zip

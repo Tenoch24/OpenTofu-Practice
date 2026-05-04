@@ -1,0 +1,6 @@
+{
+  "ticket_id": "tk-002",
+  "customer": "professor@uag.mx",
+  "priority_score": 55,
+  "description": "The export button in the reports module is not generating the correct file format"
+}
