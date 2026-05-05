@@ -1,136 +1,288 @@
 # Support Ticket Classifier Pipeline
 
-**Scenario C — Big Data class assignment**  
-Infrastructure as Code with **OpenTofu** on AWS: Lambda · Step Functions · S3  
-Automated CI/CD via **GitHub Actions** with OIDC (zero long-lived credentials)
+**Scenario C — Big Data · Universidad Autónoma de Guadalajara**
+
+A fully automated support-ticket triage system deployed on AWS with a single command.  
+Three Lambda functions orchestrated by Step Functions classify every incoming ticket as `urgent`, `normal`, or `low` and store the result in S3 — **zero console clicks required**.
+
+> **Stack:** OpenTofu · AWS Lambda (Python 3.11) · Step Functions · S3 · IAM
 
 ---
 
-## What This Does
+## Table of Contents
 
-A support ticket arrives as a JSON event. The pipeline automatically:
+1. [How It Works](#how-it-works)
+2. [Architecture](#architecture)
+3. [Data Flow — JSON at every stage](#data-flow--json-at-every-stage)
+4. [Lambda Functions](#lambda-functions)
+5. [Step Functions State Machine](#step-functions-state-machine)
+6. [IAM Security Model](#iam-security-model)
+7. [Infrastructure Module](#infrastructure-module)
+8. [Folder Structure](#folder-structure)
+9. [Prerequisites](#prerequisites)
+10. [Deployment](#deployment)
+11. [Testing](#testing)
+12. [Destroy](#destroy)
+13. [Technical Constraints Checklist](#technical-constraints-checklist)
 
-1. **Validates** all required fields and score range
-2. **Classifies** the ticket as `urgent`, `normal`, or `low` based on score + keywords
-3. **Routes** the enriched event to the correct S3 prefix
+---
 
-Everything is deployed with a single `tofu apply` — no console clicks.
+## How It Works
+
+A ticket arrives as a JSON event with four fields:
+
+```json
+{
+  "ticket_id":      "tk-001",
+  "customer":       "student@uag.mx",
+  "priority_score": 90,
+  "description":    "The system has been unresponsive for 2 hours, affecting all users"
+}
+```
+
+It passes through three Lambda functions in sequence:
+
+```
+L1 ticket-validator  →  L2 ticket-classifier  →  L3 ticket-router  →  S3
+```
+
+Each Lambda **receives the full event** and **returns it enriched** with additional fields, preserving every key from the previous step. If L1 fails, execution stops immediately — L2 and L3 never run.
 
 ---
 
 ## Architecture
 
 ```
-                         ┌──────────────────────────────────────────────┐
-  JSON Event             │         AWS Step Functions State Machine       │
-  {ticket_id,   ──────►  │                                              │
-   customer,             │  ┌──────────────┐    ┌──────────────┐        │
-   priority_score,       │  │ ValidateTicket│───►│ClassifyTicket│        │
-   description}          │  │   (Lambda L1) │    │  (Lambda L2) │        │
-                         │  └──────┬───────┘    └──────┬───────┘        │
-                         │         │ error              │                │
-                         │         ▼                    ▼                │
-                         │  ╔══════════════╗   ┌────────────────┐       │
-                         │  ║Validation    ║   │ RouteByseverity│       │
-                         │  ║Failed ✗ Fail ║   │   (Choice)     │       │
-                         │  ╚══════════════╝   └──┬──────┬──┬───┘       │
-                         │                     urgent normal low         │
-                         │                        └──────┴──┘           │
-                         │                               │               │
-                         │                        ┌──────▼───────┐      │
-                         │                        │  StoreTicket  │      │
-                         │                        │  (Lambda L3)  │      │
-                         │                        └──────┬───────┘      │
-                         │                               │ error         │
-                         │              ┌────────────────┼──────────►   │
-                         │              │                ▼          ╔══════════╗
-                         │              │       ┌──────────────┐    ║ Routing  ║
-                         │              │       │TicketProcessed│    ║Failed ✗ ║
-                         │              │       │  ✓ Succeed   │    ╚══════════╝
-                         │              │       └──────────────┘          │
-                         └─────────────────────────────────────────────────┘
-                                                        │
-                                                        ▼
-                                         s3://ticket-classifier-pipeline/
-                                         ├── urgent/  tk-001_....json
-                                         ├── normal/  tk-002_....json
-                                         └── low/     tk-003_....json
+  Input JSON
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  AWS Step Functions State Machine                    │
+│                   "ticket-classifier-pipeline"                       │
+│                                                                      │
+│   ┌─────────────────┐       ┌──────────────────┐                    │
+│   │  ValidateTicket  │──────▶│  ClassifyTicket   │                   │
+│   │   Task (L1)      │       │   Task (L2)        │                   │
+│   └────────┬─────────┘       └────────┬─────────┘                   │
+│            │ on error                 │                              │
+│            ▼                          ▼                              │
+│   ╔══════════════════╗      ┌──────────────────────┐                │
+│   ║ ValidationFailed ║      │   RouteByseverity     │               │
+│   ║   Fail  ✗        ║      │   Choice  (3 branches)│               │
+│   ╚══════════════════╝      └───┬──────────┬────┬──┘                │
+│                              urgent     normal  low                  │
+│                                 └──────────┴────┘                   │
+│                                            │                         │
+│                                 ┌──────────▼──────────┐             │
+│                                 │     StoreTicket      │             │
+│                                 │      Task (L3)        │             │
+│                                 └──────────┬──────────┘             │
+│                                            │ on error               │
+│                              ┌─────────────┼──────────────────┐     │
+│                              ▼             ▼                   │     │
+│                   ╔═══════════════╗  ┌──────────────┐         │     │
+│                   ║ RoutingFailed ║  │TicketProcessed│         │     │
+│                   ║   Fail  ✗     ║  │  Succeed  ✓  │         │     │
+│                   ╚═══════════════╝  └──────────────┘         │     │
+└─────────────────────────────────────────────────────────────────────┘
+                                            │
+                                            ▼
+                             s3://ticket-classifier-pipeline/
+                             ├── urgent/  tk-001_20260504T120000Z.json
+                             ├── normal/  tk-002_20260504T120100Z.json
+                             └── low/     tk-003_20260504T120200Z.json
 ```
+
+---
+
+## Data Flow — JSON at every stage
+
+This shows exactly what the event looks like as it moves through the pipeline.
+
+### Input (sent to Step Functions)
+
+```json
+{
+  "ticket_id":      "tk-001",
+  "customer":       "student@uag.mx",
+  "priority_score": 90,
+  "description":    "The system has been unresponsive for 2 hours, affecting all users"
+}
+```
+
+### After L1 — ticket-validator
+
+```json
+{
+  "ticket_id":          "tk-001",
+  "customer":           "student@uag.mx",
+  "priority_score":     90,
+  "description":        "The system has been unresponsive for 2 hours, affecting all users",
+  "validated":          true,
+  "validation_message": "All fields passed validation"
+}
+```
+
+### After L2 — ticket-classifier
+
+```json
+{
+  "ticket_id":               "tk-001",
+  "customer":                "student@uag.mx",
+  "priority_score":          90,
+  "description":             "The system has been unresponsive for 2 hours, affecting all users",
+  "validated":               true,
+  "validation_message":      "All fields passed validation",
+  "severity":                "urgent",
+  "urgent_keywords_matched": 1,
+  "low_keywords_matched":    0,
+  "classification_message":  "Ticket classified as 'urgent' (score=90, urgent_kw=1, low_kw=0)"
+}
+```
+
+### After L3 — ticket-router (final output, stored in S3)
+
+```json
+{
+  "ticket_id":               "tk-001",
+  "customer":                "student@uag.mx",
+  "priority_score":          90,
+  "description":             "The system has been unresponsive for 2 hours, affecting all users",
+  "validated":               true,
+  "validation_message":      "All fields passed validation",
+  "severity":                "urgent",
+  "urgent_keywords_matched": 1,
+  "low_keywords_matched":    0,
+  "classification_message":  "Ticket classified as 'urgent' (score=90, urgent_kw=1, low_kw=0)",
+  "routed":                  true,
+  "s3_bucket":               "ticket-classifier-pipeline",
+  "s3_key":                  "urgent/tk-001_20260504T120000Z.json",
+  "routing_message":         "Stored at s3://ticket-classifier-pipeline/urgent/tk-001_20260504T120000Z.json"
+}
+```
+
+### On validation failure (ValidationFailed Fail state)
+
+```json
+{
+  "ticket_id":      "",
+  "customer":       "",
+  "priority_score": 150,
+  "description":    ""
+}
+```
+
+L1 raises `ValueError: Validation failed: Missing required field: ticket_id; Missing required field: customer; priority_score must be between 0 and 100; description must be a non-empty string` — Step Functions catches it and terminates at `ValidationFailed`.
 
 ---
 
 ## Lambda Functions
 
-### L1 — ticket-validator
+### L1 — ticket-validator (`lambdas/validate/lambda_function.py`)
 
-Reads the raw event and enforces these rules before anything else runs:
+Validates the raw input. All four fields must pass — **a single failure raises an exception** and stops the pipeline.
 
-| Field | Rule |
+| Field | Validation rule |
 |---|---|
-| `ticket_id` | Must be present and non-empty |
-| `customer` | Must be present and non-empty |
-| `priority_score` | Must be a number between 0 and 100 |
-| `description` | Must be a non-empty string |
+| `ticket_id` | Present and non-empty string |
+| `customer` | Present and non-empty string |
+| `priority_score` | Numeric value in range `[0, 100]` |
+| `description` | Non-empty string |
 
-On success it returns the full event enriched with `validated: true` and `validation_message`.  
-On any failure it raises `ValueError`, which the Step Functions `Catch` block routes to the `ValidationFailed` Fail state.
+**Adds to event:** `validated` (bool), `validation_message` (str)
 
-### L2 — ticket-classifier
+---
 
-Applies a two-factor classification: **numeric score** and **keyword matching** on the description.
+### L2 — ticket-classifier (`lambdas/classify/lambda_function.py`)
 
-| Condition | Severity |
+Applies **two independent signals** — score and keyword scan — to assign a severity.
+
+| Condition | Result |
 |---|---|
-| `priority_score >= 70` OR any urgent keyword found | `urgent` |
-| `priority_score <= 35` AND no urgent keywords AND any low keyword | `low` |
+| `priority_score >= 70` **or** any urgent keyword in description | `urgent` |
+| `priority_score <= 35` **and** no urgent keywords **and** any low keyword | `low` |
 | Everything else | `normal` |
 
-**Urgent keywords:** `urgent`, `emergency`, `critical`, `down`, `outage`, `not working`, `unresponsive`, `broken`, `crash`, `failure`
+**Urgent keywords** (raise severity):
+`urgent` · `emergency` · `critical` · `down` · `outage` · `not working` · `unresponsive` · `broken` · `crash` · `failure`
 
-**Low keywords:** `question`, `inquiry`, `how to`, `documentation`, `feedback`, `suggestion`, `info`, `curious`
+**Low keywords** (lower severity, only when no urgent signals):
+`question` · `inquiry` · `how to` · `documentation` · `feedback` · `suggestion` · `info` · `curious`
 
-Returns the full event enriched with `severity`, `urgent_keywords_matched`, `low_keywords_matched`, and `classification_message`.
+**Adds to event:** `severity`, `urgent_keywords_matched`, `low_keywords_matched`, `classification_message`
 
-### L3 — ticket-router
+---
 
-Reads `severity` and `ticket_id` from the event, then writes the full enriched JSON to:
+### L3 — ticket-router (`lambdas/route/lambda_function.py`)
+
+Writes the fully-enriched event to S3 using the key pattern:
 
 ```
-s3://ticket-classifier-pipeline/<severity>/<ticket_id>_<timestamp>.json
+<severity>/<ticket_id>_<UTC-timestamp>.json
 ```
 
-Returns the full event enriched with `routed: true`, `s3_bucket`, `s3_key`, and `routing_message`.
+The S3 client reads `BUCKET_NAME` from an environment variable injected by OpenTofu at deploy time.
+
+**Adds to event:** `routed`, `s3_bucket`, `s3_key`, `routing_message`
 
 ---
 
 ## Step Functions State Machine
 
-The machine has exactly **7 states** (class maximum):
+Defined entirely in `step_function.tf` using `jsonencode()`. Exactly **7 states** (class maximum):
 
-| # | State | Type | Description |
-|---|---|---|---|
-| 1 | `ValidateTicket` | Task | Invokes L1. On any error → `ValidationFailed` |
-| 2 | `ClassifyTicket` | Task | Invokes L2. On any error → `ValidationFailed` |
-| 3 | `RouteByseverity` | Choice | Branches on `$.severity` with `StringEquals` for `urgent`, `normal`, `low`. Default also → `StoreTicket` |
-| 4 | `StoreTicket` | Task | Invokes L3. On any error → `RoutingFailed` |
-| 5 | `TicketProcessed` | Succeed | Terminal success state |
-| 6 | `ValidationFailed` | Fail | Terminal failure for L1/L2 errors |
-| 7 | `RoutingFailed` | Fail | Terminal failure for L3 errors |
+| # | State name | Type | On success | On error |
+|---|---|---|---|---|
+| 1 | `ValidateTicket` | Task | → ClassifyTicket | → ValidationFailed |
+| 2 | `ClassifyTicket` | Task | → RouteByseverity | → ValidationFailed |
+| 3 | `RouteByseverity` | Choice | → StoreTicket (all 3 branches) | — |
+| 4 | `StoreTicket` | Task | → TicketProcessed | → RoutingFailed |
+| 5 | `TicketProcessed` | Succeed | terminal ✓ | — |
+| 6 | `ValidationFailed` | Fail | — | terminal ✗ |
+| 7 | `RoutingFailed` | Fail | — | terminal ✗ |
+
+The Choice state uses `StringEquals` on `$.severity` with three explicit branches (`urgent`, `normal`, `low`) plus a `Default` that also goes to `StoreTicket`, making it impossible for a classified ticket to be dropped.
 
 ---
 
 ## IAM Security Model
 
-Two least-privilege roles are created by `iam.tf`:
+Two roles are created in `iam.tf`. Neither has wildcard resource permissions.
 
-**`ticket-classifier-lambda-role`** — assumed by all three Lambda functions
-- `AWSLambdaBasicExecutionRole` → write CloudWatch Logs
-- Inline policy → `s3:PutObject` and `s3:GetObject` on the tickets bucket only
+### `ticket-classifier-lambda-role`
 
-**`ticket-classifier-sfn-role`** — assumed by the Step Functions state machine
-- Inline policy → `lambda:InvokeFunction` on the three Lambda ARNs only
+Assumed by: `lambda.amazonaws.com`
 
-No `*` resources, no admin policies.
+| Permission | Scope |
+|---|---|
+| CloudWatch Logs (write) | Via AWS managed policy `AWSLambdaBasicExecutionRole` |
+| `s3:PutObject`, `s3:GetObject` | Inline policy — scoped to `ticket-classifier-pipeline/*` only |
+
+### `ticket-classifier-sfn-role`
+
+Assumed by: `states.amazonaws.com`
+
+| Permission | Scope |
+|---|---|
+| `lambda:InvokeFunction` | Inline policy — scoped to the three Lambda ARNs only |
+
+---
+
+## Infrastructure Module
+
+The reusable module at `modules/lambda_function/` is called three times in `main.tf`, once per Lambda. It does two things:
+
+1. **Zips the source directory** using the `archive_file` data source (no shell commands, cross-platform)
+2. **Creates the Lambda function** with the zip, runtime, handler, role, env vars, and tags
+
+```
+modules/lambda_function/
+├── main.tf        # archive_file + aws_lambda_function
+├── variables.tf   # function_name, source_dir, role_arn, environment_variables, project_tag
+└── outputs.tf     # function_arn, function_name
+```
+
+The module outputs `function_arn` which `step_function.tf` uses to build the state machine definition — no hardcoded ARNs anywhere.
 
 ---
 
@@ -138,144 +290,183 @@ No `*` resources, no admin policies.
 
 ```
 .
-├── main.tf                          # Providers, S3 bucket, Lambda modules
-├── iam.tf                           # IAM roles and policies
-├── variables.tf                     # Input variables with defaults
+├── main.tf                          # Providers, S3 bucket, three Lambda module calls
+├── iam.tf                           # IAM roles and least-privilege policies
+├── variables.tf                     # aws_region, project_name, bucket_name (all with defaults)
 ├── outputs.tf                       # state_machine_arn, s3_bucket_name
-├── step_function.tf                 # Step Functions state machine definition
+├── step_function.tf                 # Full state machine definition (7 states)
 │
 ├── modules/
-│   └── lambda_function/             # Reusable module — used 3 times
-│       ├── main.tf                  # archive_file data source + aws_lambda_function
-│       ├── variables.tf             # function_name, source_dir, role_arn, etc.
-│       └── outputs.tf               # function_arn, function_name
+│   └── lambda_function/             # Reusable Lambda module (zip + deploy)
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
 │
 ├── lambdas/
-│   ├── validate/lambda_function.py  # L1 — field validation
-│   ├── classify/lambda_function.py  # L2 — score + keyword classification
-│   └── route/lambda_function.py     # L3 — S3 write
+│   ├── validate/
+│   │   └── lambda_function.py       # L1 — validates ticket_id, customer, score, description
+│   ├── classify/
+│   │   └── lambda_function.py       # L2 — score + keyword → urgent / normal / low
+│   └── route/
+│       └── lambda_function.py       # L3 — writes enriched JSON to S3
 │
 └── tests/
-    ├── test_urgent.json             # score=90 + urgent keywords → urgent branch
-    ├── test_normal.json             # score=55 + no keywords    → normal branch
-    ├── test_low.json                # score=20 + low keywords   → low branch
-    └── test_invalid.json            # missing fields + score=150 → ValidationFailed
+    ├── test_urgent.json             # score=90, "unresponsive" keyword  →  urgent branch
+    ├── test_normal.json             # score=55, no keywords             →  normal branch
+    ├── test_low.json                # score=20, "question" keyword      →  low branch
+    └── test_invalid.json            # empty fields, score=150           →  ValidationFailed
 ```
 
 ---
 
-## Local Deployment
+## Prerequisites
 
-### Prerequisites
+| Tool | Version | Install |
+|---|---|---|
+| OpenTofu | >= 1.6.0 | [opentofu.org/docs/intro/install](https://opentofu.org/docs/intro/install/) |
+| AWS CLI | v2 | [docs.aws.amazon.com/cli](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) |
+| AWS credentials | — | IAM user or role with Lambda + Step Functions + S3 + IAM permissions |
 
-- [OpenTofu](https://opentofu.org/docs/intro/install/) >= 1.6.0
-- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) configured with credentials that have permissions for Lambda, Step Functions, S3, and IAM
+Configure and verify credentials:
 
 ```bash
-aws configure        # enter Access Key, Secret, region us-east-1, output json
-aws sts get-caller-identity   # verify it works
+aws configure
+# AWS Access Key ID:     <your key>
+# AWS Secret Access Key: <your secret>
+# Default region name:   us-east-1
+# Default output format: json
+
+aws sts get-caller-identity   # should print your Account ID
 ```
 
-### Deploy
+---
+
+## Deployment
+
+### 1 — Initialize
+
+Downloads providers (`hashicorp/aws`, `hashicorp/archive`) and links the local module.
 
 ```bash
 tofu init
+```
+
+### 2 — Preview
+
+Shows every resource that will be created before touching AWS.
+
+```bash
 tofu plan
+```
+
+### 3 — Deploy
+
+Creates all resources in the correct dependency order. Takes ~30 seconds.
+
+```bash
 tofu apply
 ```
 
-`tofu apply` outputs the two values you'll need for testing:
+At the end OpenTofu prints:
 
 ```
-state_machine_arn = "arn:aws:states:us-east-1:ACCOUNT:stateMachine:ticket-classifier-pipeline"
+Apply complete! Resources: 10 added, 0 changed, 0 destroyed.
+
+Outputs:
+
 s3_bucket_name    = "ticket-classifier-pipeline"
+state_machine_arn = "arn:aws:states:us-east-1:ACCOUNT_ID:stateMachine:ticket-classifier-pipeline"
 ```
 
-### Destroy
-
-```bash
-tofu destroy
-```
-
-`force_destroy = true` is set on the S3 bucket so all objects are removed automatically — no manual cleanup needed.
+These two outputs are used in every test command below.
 
 ---
 
 ## Testing
 
-### Option A — Invoke each Lambda directly
+### Quick check — invoke each Lambda directly
 
-Use these commands to test each function in isolation. The `--cli-binary-format raw-in-base64-out` flag is required on AWS CLI v2.
+Good for verifying a single function without running the full pipeline.
 
-**L1 — ticket-validator (valid input)**
+**Validate a correct ticket (expect `"validated": true`)**
+
 ```bash
 aws lambda invoke \
   --function-name ticket-validator \
-  --payload '{"ticket_id":"T001","customer":"user@example.com","priority_score":85,"description":"Server is down"}' \
   --cli-binary-format raw-in-base64-out \
-  response.json && cat response.json
+  --payload '{"ticket_id":"T001","customer":"user@uag.mx","priority_score":85,"description":"Server is down"}' \
+  out.json && cat out.json
 ```
-Expected: `"validated": true`
 
-**L1 — ticket-validator (invalid input)**
+**Validate an invalid ticket (expect `FunctionError`)**
+
 ```bash
 aws lambda invoke \
   --function-name ticket-validator \
+  --cli-binary-format raw-in-base64-out \
   --payload '{"ticket_id":"","customer":"","priority_score":150,"description":""}' \
-  --cli-binary-format raw-in-base64-out \
-  response.json && cat response.json
+  out.json && cat out.json
 ```
-Expected: `FunctionError` with `"Validation failed: ..."`
 
-**L2 — ticket-classifier**
+**Classify a ticket (expect `"severity": "urgent"`)**
+
 ```bash
 aws lambda invoke \
   --function-name ticket-classifier \
-  --payload '{"ticket_id":"T001","customer":"user@example.com","priority_score":85,"description":"critical outage","validated":true}' \
   --cli-binary-format raw-in-base64-out \
-  response.json && cat response.json
+  --payload '{"ticket_id":"T001","customer":"user@uag.mx","priority_score":85,"description":"critical outage","validated":true}' \
+  out.json && cat out.json
 ```
-Expected: `"severity": "urgent"`
 
-**L3 — ticket-router**
+**Route a ticket (expect `"routed": true` and `s3_key`)**
+
 ```bash
 aws lambda invoke \
   --function-name ticket-router \
-  --payload '{"ticket_id":"T001","customer":"user@example.com","priority_score":85,"description":"outage","validated":true,"severity":"urgent"}' \
   --cli-binary-format raw-in-base64-out \
-  response.json && cat response.json
+  --payload '{"ticket_id":"T001","customer":"user@uag.mx","priority_score":85,"description":"outage","validated":true,"severity":"urgent"}' \
+  out.json && cat out.json
 ```
-Expected: `"routed": true` and an `s3_key` like `urgent/T001_20260504T....json`
 
-### Option B — Run the full pipeline through Step Functions
+---
 
-This is the real end-to-end test. All four branches covered:
+### Full pipeline — run all four test cases through Step Functions
+
+This is the definitive end-to-end test. Run all four cases to exercise every branch of the state machine.
 
 ```bash
 SFN_ARN=$(tofu output -raw state_machine_arn)
 
-# Urgent branch — score=90 + urgent keywords
+# Branch: urgent  — score=90, "unresponsive" keyword
 aws stepfunctions start-execution \
-  --state-machine-arn $SFN_ARN \
+  --state-machine-arn "$SFN_ARN" \
+  --name "test-urgent-$(date +%s)" \
   --input file://tests/test_urgent.json
 
-# Normal branch — score=55 + no keywords
+# Branch: normal  — score=55, no keywords
 aws stepfunctions start-execution \
-  --state-machine-arn $SFN_ARN \
+  --state-machine-arn "$SFN_ARN" \
+  --name "test-normal-$(date +%s)" \
   --input file://tests/test_normal.json
 
-# Low branch — score=20 + low keywords
+# Branch: low     — score=20, "question" keyword
 aws stepfunctions start-execution \
-  --state-machine-arn $SFN_ARN \
+  --state-machine-arn "$SFN_ARN" \
+  --name "test-low-$(date +%s)" \
   --input file://tests/test_low.json
 
-# ValidationFailed branch — empty fields + score=150
+# Branch: ValidationFailed — empty fields, score=150
 aws stepfunctions start-execution \
-  --state-machine-arn $SFN_ARN \
+  --state-machine-arn "$SFN_ARN" \
+  --name "test-invalid-$(date +%s)" \
   --input file://tests/test_invalid.json
 ```
 
+---
+
 ### Verify S3 routing
+
+After the first three executions succeed, three files should appear in the bucket — one per severity prefix:
 
 ```bash
 BUCKET=$(tofu output -raw s3_bucket_name)
@@ -283,33 +474,68 @@ aws s3 ls s3://$BUCKET --recursive
 ```
 
 Expected output:
+
 ```
-2026-05-04 ...  urgent/tk-001_20260504T....json
-2026-05-04 ...  normal/tk-002_20260504T....json
-2026-05-04 ...  low/tk-003_20260504T....json
+2026-05-04 12:00:00    952  urgent/tk-001_20260504T120000Z.json
+2026-05-04 12:00:05    921  normal/tk-002_20260504T120005Z.json
+2026-05-04 12:00:10    908  low/tk-003_20260504T120010Z.json
 ```
+
+Download and inspect a file:
+
+```bash
+aws s3 cp s3://$BUCKET/urgent/tk-001_<timestamp>.json - | python -m json.tool
+```
+
+---
+
+### Check execution status
+
+```bash
+# List recent executions
+aws stepfunctions list-executions \
+  --state-machine-arn "$SFN_ARN" \
+  --query "executions[*].{name:name,status:status}" \
+  --output table
+```
+
+Expected: three `SUCCEEDED` and one `FAILED` (the invalid ticket).
+
+---
 
 ### Check Lambda logs
 
 ```bash
-aws logs tail /aws/lambda/ticket-validator   --follow
-aws logs tail /aws/lambda/ticket-classifier  --follow
-aws logs tail /aws/lambda/ticket-router      --follow
+aws logs tail /aws/lambda/ticket-validator  --follow
+aws logs tail /aws/lambda/ticket-classifier --follow
+aws logs tail /aws/lambda/ticket-router     --follow
+```
+
+---
+
+## Destroy
+
+Deletes all AWS resources created by this project. The S3 bucket has `force_destroy = true`, so OpenTofu empties it automatically before deleting it.
+
+```bash
+tofu destroy
 ```
 
 ---
 
 ## Technical Constraints Checklist
 
-| Constraint | Status | Detail |
+| Constraint | Status | Evidence |
 |---|---|---|
 | Exactly 3 Lambda functions | ✅ | `ticket-validator`, `ticket-classifier`, `ticket-router` |
-| Exactly 1 Choice state | ✅ | `RouteByseverity` with `StringEquals` on `$.severity` |
-| Choice has 3 branches | ✅ | `urgent` / `normal` / `low` + Default |
+| All Lambdas in `python3.11` | ✅ | `runtime = "python3.11"` in module `main.tf` |
+| Each Lambda receives full event and returns it enriched | ✅ | All three use `{**event, ...new_fields}` |
+| Exactly 1 Choice state | ✅ | `RouteByseverity` in `step_function.tf` |
+| Choice has 3 branches | ✅ | `StringEquals` for `urgent`, `normal`, `low` + Default |
 | At least 1 Fail state | ✅ | 2 Fail states: `ValidationFailed`, `RoutingFailed` |
 | At least 1 Succeed state | ✅ | `TicketProcessed` |
-| Max 7 total states | ✅ | Exactly 7 |
-| Deploy with `tofu apply` only | ✅ | No console interaction required |
-| `tofu destroy` cleans everything | ✅ | `force_destroy = true` on S3 |
-| Lambdas receive full event and return it enriched | ✅ | All three use `{**event, ...new_fields}` |
-| Reusable module for Lambda | ✅ | `modules/lambda_function/` used 3 times |
+| Maximum 7 states total | ✅ | Exactly 7 — no more allowed |
+| Deploy with `tofu apply` only | ✅ | No AWS console interaction at any step |
+| `tofu destroy` cleans everything | ✅ | `force_destroy = true` on S3, all resources in state |
+| Least-privilege IAM | ✅ | No `*` resources; roles scoped to exact ARNs |
+| Reusable Lambda module | ✅ | `modules/lambda_function/` instantiated 3 times |
