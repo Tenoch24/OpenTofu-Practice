@@ -15,14 +15,15 @@ provider "aws" {
 # ── Build output directory (zips land here) ───────────────────
 resource "null_resource" "builds_dir" {
   provisioner "local-exec" {
-    command = "mkdir -p ${path.module}/builds"
+    command = "New-Item -ItemType Directory -Force -Path ${path.module}/builds"
+    interpreter = ["PowerShell", "-Command"]
   }
 }
 
 # ── S3 bucket for routed tickets ──────────────────────────────
 resource "aws_s3_bucket" "tickets" {
   bucket        = var.bucket_name
-  force_destroy = true          # tofu destroy cleans this up
+  force_destroy = true # tofu destroy cleans this up
 
   tags = { Project = var.project_name }
 }
