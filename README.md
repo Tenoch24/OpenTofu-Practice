@@ -155,15 +155,11 @@ No `*` resources, no admin policies.
 │   ├── classify/lambda_function.py  # L2 — score + keyword classification
 │   └── route/lambda_function.py     # L3 — S3 write
 │
-├── tests/
-│   ├── test_urgent.json             # score=90 + urgent keywords → urgent branch
-│   ├── test_normal.json             # score=55 + no keywords    → normal branch
-│   ├── test_low.json                # score=20 + low keywords   → low branch
-│   └── test_invalid.json            # missing fields + score=150 → ValidationFailed
-│
-└── .github/
-    └── workflows/
-        └── opentofu.yml             # CI/CD: plan on PR, apply on push to main
+└── tests/
+    ├── test_urgent.json             # score=90 + urgent keywords → urgent branch
+    ├── test_normal.json             # score=55 + no keywords    → normal branch
+    ├── test_low.json                # score=20 + low keywords   → low branch
+    └── test_invalid.json            # missing fields + score=150 → ValidationFailed
 ```
 
 ---
@@ -303,86 +299,6 @@ aws logs tail /aws/lambda/ticket-router      --follow
 
 ---
 
-## CI/CD with GitHub Actions
-
-The workflow at `.github/workflows/opentofu.yml` runs automatically:
-
-| Event | Job name | Steps |
-|---|---|---|
-| Pull request → `main` | `plan` | init → validate → plan |
-| Push → `main` | `apply` | init → validate → plan → apply |
-
-Authentication uses **OIDC** — GitHub signs a JWT that AWS verifies. No access keys, no secrets stored in GitHub.
-
-### One-time AWS setup (do this once per AWS account)
-
-**Step 1 — Create the OIDC identity provider**
-
-```bash
-aws iam create-open-id-connect-provider \
-  --url https://token.actions.githubusercontent.com \
-  --client-id-list sts.amazonaws.com \
-  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
-```
-
-**Step 2 — Create the IAM role with a trust policy scoped to your repo**
-
-Replace `YOUR_ACCOUNT_ID` and `YOUR_GITHUB_USER/YOUR_REPO`:
-
-```bash
-aws iam create-role \
-  --role-name ticket-classifier-gha \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:YOUR_GITHUB_USER/YOUR_REPO:*"
-        }
-      }
-    }]
-  }'
-```
-
-**Step 3 — Attach the required policies to the role**
-
-```bash
-aws iam attach-role-policy --role-name ticket-classifier-gha \
-  --policy-arn arn:aws:iam::aws:policy/AWSLambda_FullAccess
-
-aws iam attach-role-policy --role-name ticket-classifier-gha \
-  --policy-arn arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
-
-aws iam attach-role-policy --role-name ticket-classifier-gha \
-  --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-
-aws iam attach-role-policy --role-name ticket-classifier-gha \
-  --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
-
-aws iam attach-role-policy --role-name ticket-classifier-gha \
-  --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
-```
-
-**Step 4 — Update the workflow with the role ARN**
-
-In `.github/workflows/opentofu.yml`, set:
-
-```yaml
-AWS_ROLE: "arn:aws:iam::YOUR_ACCOUNT_ID:role/ticket-classifier-gha"
-```
-
-After that, every push to `main` triggers a full deploy automatically.
-
----
-
 ## Technical Constraints Checklist
 
 | Constraint | Status | Detail |
@@ -397,4 +313,3 @@ After that, every push to `main` triggers a full deploy automatically.
 | `tofu destroy` cleans everything | ✅ | `force_destroy = true` on S3 |
 | Lambdas receive full event and return it enriched | ✅ | All three use `{**event, ...new_fields}` |
 | Reusable module for Lambda | ✅ | `modules/lambda_function/` used 3 times |
-| CI/CD without long-lived credentials | ✅ | GitHub Actions + OIDC, zero secrets stored |
