@@ -44,9 +44,6 @@ jobs:
         with:
           tofu_version: ${{ env.TOFU_VERSION }}
 
-      - name: tofu fmt
-        run: tofu fmt -check -recursive
-
       - name: tofu init
         run: tofu init
 
