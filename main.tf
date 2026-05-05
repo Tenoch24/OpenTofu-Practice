@@ -15,7 +15,7 @@ provider "aws" {
 # ── Build output directory (zips land here) ───────────────────
 resource "null_resource" "builds_dir" {
   provisioner "local-exec" {
-    command = "New-Item -ItemType Directory -Force -Path ${path.module}/builds"
+    command     = "New-Item -ItemType Directory -Force -Path ${path.module}/builds"
     interpreter = ["PowerShell", "-Command"]
   }
 }
